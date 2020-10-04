@@ -1,4 +1,4 @@
-Raspberry Pi 8 bit parallel ili9325 LCD driver 
+Raspberry Pi 8 bit parallel ili9325 LCD driver - (Frame Buffer)
 
 This is mostly a fork from the ili9341 driver.
 
