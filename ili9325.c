@@ -1,19 +1,17 @@
 // ili9325 LCD for Raspberry Pi
-//   register setup similar to the ili9341
 //   chip id = 0x6809, force use = 0x9325
 
 #define BCM2708_PERI_BASE        0x20000000
 #define GPIO_BASE                (BCM2708_PERI_BASE + 0x200000) /* GPIO controller */
 
 #include <linux/module.h>
+#include <linux/moduleparam.h>
 #include <linux/kernel.h>
 #include <linux/errno.h>
 #include <linux/string.h>
 #include <linux/mm.h>
 #include <linux/vmalloc.h>
 #include <linux/delay.h>
-//#include <linux/unistd.h> // udelay
-//#include <linux/time.h>
 #include <linux/random.h>
 #include <linux/interrupt.h>
 #include <linux/fb.h>
@@ -38,7 +36,7 @@
 //#define GPIO_PULL *(gpio+37) // Pull up/pull down
 //#define GPIO_PULLCLK0 *(gpio+38) // Pull up/pull down clock
 
-#define DATA0 16 // in byte aligned order
+#define DATA0 16 // in aligned order
 #define DATA1 17
 #define DATA2 18
 #define DATA3 19
@@ -54,12 +52,9 @@
 //#define IM0 27 // unused
 #define RESET 05
 
-#define ORIENTATION 0 // 0=LANDSCAPE 1=PORTRAIT   only use as Landscape
-
-#define DISPLAY_WIDTH   320
-#define DISPLAY_HEIGHT  240
-
-#define DISPLAY_BPP     16 // 565
+#define PHY_DISPLAY_WIDTH   320 // Real size
+#define PHY_DISPLAY_HEIGHT  240
+#define DISPLAY_BPP         16  // 5/6/5
 
 
 
@@ -70,7 +65,7 @@
 #define ILI932X_ENTRY_MOD          0x03
 #define ILI932X_RESIZE_CTRL        0x04
 #define ILI932X_16BITS_FORMAT      0x05
-#define ILI932X_DISP_CTRL1         0x07 // ON
+#define ILI932X_DISP_CTRL1         0x07
 #define ILI932X_DISP_CTRL2         0x08
 #define ILI932X_DISP_CTRL3         0x09
 #define ILI932X_DISP_CTRL4         0x0A
@@ -124,7 +119,7 @@ static const uint16_t ILI932x_regValues[] = {
   TFTLCD_DELAY             , 50,     // 50 millisecond delay
   ILI932X_DRIV_OUT_CTRL    , 0x0000, // can Flip Landscape - 0000 0x0x 0000 0000        0x0100
   ILI932X_DRIV_WAV_CTRL    , 0x0700, // 0x0700
-  ILI932X_ENTRY_MOD        , 0x1000, // 0x1000      1030=Landscape Mirror 1028=Messy 1000=Landsapce Flipped 1018=Messy - will be over-ridden
+  ILI932X_ENTRY_MOD        , 0x1008, // xx08=Land1 xx38=Land2 xx20=Port1 xx10=Port2-conn-side    xx18=Land-Flip xx28=Land-Flip-Mirr - will be over-ridden
   ILI932X_RESIZE_CTRL      , 0x0000, // 0x0
   ILI932X_16BITS_FORMAT    , 0x0002,
   0x06                     , 0x0,
@@ -174,9 +169,9 @@ static const uint16_t ILI932x_regValues[] = {
   ILI932X_GRAM_HOR_AD      , 0x0000,
   ILI932X_GRAM_VER_AD      , 0x0000,
   ILI932X_HOR_START_AD     , 0x0000,
-  ILI932X_HOR_END_AD       , DISPLAY_HEIGHT - 1,
+  ILI932X_HOR_END_AD       , PHY_DISPLAY_HEIGHT - 1,
   ILI932X_VER_START_AD     , 0X0000,
-  ILI932X_VER_END_AD       , DISPLAY_WIDTH - 1,
+  ILI932X_VER_END_AD       , PHY_DISPLAY_WIDTH - 1,
   ILI932X_GATE_SCAN_CTRL1  , 0xA700, // Driver Output Control (R60h) // 0xA700
   ILI932X_GATE_SCAN_CTRL2  , 0x0003, // Driver Output Control (R61h) // 0x0003
   ILI932X_GATE_SCAN_CTRL3  , 0x0000, // Driver Output Control (R62h)
@@ -191,112 +186,116 @@ static const uint16_t ILI932x_regValues[] = {
 
 
 volatile unsigned *gpio;
-static unsigned int fps;
-static unsigned int rotation = 0x1000;
+static unsigned int fps = 25;
+static unsigned int rotation = 0x1008;
+static unsigned int scale = 1;
+static unsigned int scaletype = 1;
+static uint16_t DISPLAY_WIDTH  = PHY_DISPLAY_WIDTH;
+static uint16_t DISPLAY_HEIGHT = PHY_DISPLAY_HEIGHT;
 
 
 
 // Set to output
-static void gpio_setoutput(char g)	
+static void gpio_setoutput(char g)    
 {
-	INP_GPIO(g); // must use INP_GPIO before we can use OUT_GPIO
-	OUT_GPIO(g);
+    INP_GPIO(g); // must use INP_GPIO before we can use OUT_GPIO
+    OUT_GPIO(g);
 }
 
 // Set state 1=high 0=low
-static void gpio_setstate(char g,char state)	
+static void gpio_setstate(char g,char state)    
 {
-	(state) ? (GPIO_SET = 1<<g) : (GPIO_CLR = 1<<g) ;
+    (state) ? (GPIO_SET = 1<<g) : (GPIO_CLR = 1<<g) ;
 }
 /*
 static int gpio_read(void)
 {
-	int value = 0;
+    int value = 0;
 
-	INP_GPIO(DATA0);
-	INP_GPIO(DATA1);
-	INP_GPIO(DATA2);
-	INP_GPIO(DATA3);
-	INP_GPIO(DATA4);
-	INP_GPIO(DATA5);
-	INP_GPIO(DATA6);
-	INP_GPIO(DATA7);
-	gpio_setstate(RD,0);
+    INP_GPIO(DATA0);
+    INP_GPIO(DATA1);
+    INP_GPIO(DATA2);
+    INP_GPIO(DATA3);
+    INP_GPIO(DATA4);
+    INP_GPIO(DATA5);
+    INP_GPIO(DATA6);
+    INP_GPIO(DATA7);
+    gpio_setstate(RD,0);
 udelay(1);
-        value |= GET_GPIO(16) ? 0x0100 : 0;
-        value |= GET_GPIO(17) ? 0x0200 : 0;
-        value |= GET_GPIO(18) ? 0x0400 : 0;
-        value |= GET_GPIO(19) ? 0x0800 : 0;
-        value |= GET_GPIO(20) ? 0x1000 : 0;
-        value |= GET_GPIO(21) ? 0x2000 : 0;
-        value |= GET_GPIO(22) ? 0x4000 : 0;
-        value |= GET_GPIO(23) ? 0x8000 : 0;
-        gpio_setstate(RD,1);
+    value |= GET_GPIO(16) ? 0x0100 : 0;
+    value |= GET_GPIO(17) ? 0x0200 : 0;
+    value |= GET_GPIO(18) ? 0x0400 : 0;
+    value |= GET_GPIO(19) ? 0x0800 : 0;
+    value |= GET_GPIO(20) ? 0x1000 : 0;
+    value |= GET_GPIO(21) ? 0x2000 : 0;
+    value |= GET_GPIO(22) ? 0x4000 : 0;
+    value |= GET_GPIO(23) ? 0x8000 : 0;
+    gpio_setstate(RD,1);
 udelay(1);
-	gpio_setstate(RD,0);
+    gpio_setstate(RD,0);
 udelay(1);
-        value |= GET_GPIO(16) ? 0x0001 : 0;
-        value |= GET_GPIO(17) ? 0x0002 : 0;
-        value |= GET_GPIO(18) ? 0x0004 : 0;
-        value |= GET_GPIO(19) ? 0x0008 : 0;
-        value |= GET_GPIO(20) ? 0x0010 : 0;
-        value |= GET_GPIO(21) ? 0x0020 : 0;
-        value |= GET_GPIO(22) ? 0x0040 : 0;
-        value |= GET_GPIO(23) ? 0x0080 : 0;
-        gpio_setstate(RD,1);
+    value |= GET_GPIO(16) ? 0x0001 : 0;
+    value |= GET_GPIO(17) ? 0x0002 : 0;
+    value |= GET_GPIO(18) ? 0x0004 : 0;
+    value |= GET_GPIO(19) ? 0x0008 : 0;
+    value |= GET_GPIO(20) ? 0x0010 : 0;
+    value |= GET_GPIO(21) ? 0x0020 : 0;
+    value |= GET_GPIO(22) ? 0x0040 : 0;
+    value |= GET_GPIO(23) ? 0x0080 : 0;
+    gpio_setstate(RD,1);
 
-	gpio_setoutput(DATA0);
-	gpio_setoutput(DATA1);
-	gpio_setoutput(DATA2);
-	gpio_setoutput(DATA3);
-	gpio_setoutput(DATA4);
-	gpio_setoutput(DATA5);
-	gpio_setoutput(DATA6);
-	gpio_setoutput(DATA7);
+    gpio_setoutput(DATA0);
+    gpio_setoutput(DATA1);
+    gpio_setoutput(DATA2);
+    gpio_setoutput(DATA3);
+    gpio_setoutput(DATA4);
+    gpio_setoutput(DATA5);
+    gpio_setoutput(DATA6);
+    gpio_setoutput(DATA7);
 
-	return value;
+    return value;
 }
 */
 // initialization of GPIO
-static void tft_init_board(struct fb_info *info)	
+static void tft_init_board(struct fb_info *info)    
 {
-	//printk(KERN_INFO "fb%d: tft_init_board\n", info->node);
-	gpio_setoutput(DATA0);
-	gpio_setoutput(DATA1);
-	gpio_setoutput(DATA2);
-	gpio_setoutput(DATA3);
-	gpio_setoutput(DATA4);
-	gpio_setoutput(DATA5);
-	gpio_setoutput(DATA6);
-	gpio_setoutput(DATA7);
+    //printk(KERN_INFO "fb%d: tft_init_board\n", info->node);
+    gpio_setoutput(DATA0);
+    gpio_setoutput(DATA1);
+    gpio_setoutput(DATA2);
+    gpio_setoutput(DATA3);
+    gpio_setoutput(DATA4);
+    gpio_setoutput(DATA5);
+    gpio_setoutput(DATA6);
+    gpio_setoutput(DATA7);
 
-	gpio_setoutput(DC);
-	gpio_setoutput(CS);
-	gpio_setoutput(RD);
-	gpio_setoutput(RW);
-//	gpio_setoutput(IM0);
-	gpio_setoutput(RESET);
+    gpio_setoutput(DC);
+    gpio_setoutput(CS);
+    gpio_setoutput(RD);
+    gpio_setoutput(RW);
+    //gpio_setoutput(IM0);
+    gpio_setoutput(RESET);
 
-	gpio_setstate(DATA0,0);
-	gpio_setstate(DATA1,0);
-	gpio_setstate(DATA2,0);
-	gpio_setstate(DATA3,0);
-	gpio_setstate(DATA4,0);
-	gpio_setstate(DATA5,0);
-	gpio_setstate(DATA6,0);
-	gpio_setstate(DATA7,0);
+    gpio_setstate(DATA0,0);
+    gpio_setstate(DATA1,0);
+    gpio_setstate(DATA2,0);
+    gpio_setstate(DATA3,0);
+    gpio_setstate(DATA4,0);
+    gpio_setstate(DATA5,0);
+    gpio_setstate(DATA6,0);
+    gpio_setstate(DATA7,0);
 
-	gpio_setstate(DC,1);
-	gpio_setstate(CS,1);
-	gpio_setstate(RD,1);
-	gpio_setstate(RW,1);
-//	gpio_setstate(IM0,1);
-	gpio_setstate(RESET,1);
+    gpio_setstate(DC,1);
+    gpio_setstate(CS,1);
+    gpio_setstate(RD,1);
+    gpio_setstate(RW,1);
+    //gpio_setstate(IM0,1);
+    gpio_setstate(RESET,1);
 
 }
 
 // hard reset of the graphic controller and the tft
-static void tft_hard_reset(void)	
+static void tft_hard_reset(void)    
 {
     gpio_setstate(RESET,0);
     msleep(10); // 120
@@ -304,30 +303,30 @@ static void tft_hard_reset(void)
     msleep(100); // 120
 }
 
-static void gpio_set_parallel_data(char data)	
+static void gpio_set_parallel_data(char data)    
 {
 /*
-	gpio_setstate(DATA0,((data >> 0)  & 0x01));
-	gpio_setstate(DATA1,((data >> 1)  & 0x01));
-	gpio_setstate(DATA2,((data >> 2)  & 0x01));
-	gpio_setstate(DATA3,((data >> 3)  & 0x01));
-	gpio_setstate(DATA4,((data >> 4)  & 0x01));
-	gpio_setstate(DATA5,((data >> 5)  & 0x01));
-	gpio_setstate(DATA6,((data >> 6)  & 0x01));
-	gpio_setstate(DATA7,((data >> 7)  & 0x01));
+    gpio_setstate(DATA0,((data >> 0)  & 0x01));
+    gpio_setstate(DATA1,((data >> 1)  & 0x01));
+    gpio_setstate(DATA2,((data >> 2)  & 0x01));
+    gpio_setstate(DATA3,((data >> 3)  & 0x01));
+    gpio_setstate(DATA4,((data >> 4)  & 0x01));
+    gpio_setstate(DATA5,((data >> 5)  & 0x01));
+    gpio_setstate(DATA6,((data >> 6)  & 0x01));
+    gpio_setstate(DATA7,((data >> 7)  & 0x01));
 */
-	// This assumes the data bits are in GPIO order
-	GPIO_SET =        data << DATA0; // Set the "set"   bits
-	GPIO_CLR = (char)~data << DATA0; // Set the "clear" bits
+    // This assumes the data bits are in GPIO order
+    GPIO_SET =        data << DATA0; // Set the "set"   bits
+    GPIO_CLR = (char)~data << DATA0; // Set the "clear" bits
 }
 
 // write command
-static void tft_command_write16(uint16_t command) // Implies CS/RS low	
+static void tft_command_write16(uint16_t command) // Sets CS/RS low    
 {
     gpio_setstate(CS,0);
     gpio_setstate(DC,0);
     gpio_set_parallel_data(command >> 8); // always 0
-    gpio_setstate(CS,0); // small delay
+    gpio_setstate(CS,0); // small delay - can be removed if Short & Equal Length wires are used
 //ndelay(1); // 10
     gpio_setstate(RW,0);
     gpio_setstate(CS,0); // small delay
@@ -344,7 +343,7 @@ static void tft_command_write16(uint16_t command) // Implies CS/RS low
 }
 
 // write data
-static void tft_data_write16(uint16_t data)	
+static void tft_data_write16(uint16_t data)    
 {
     gpio_setstate(DC,1);
     gpio_set_parallel_data(data >> 8);
@@ -365,269 +364,283 @@ static void tft_data_write16(uint16_t data)
 }
 
 // initialization of ili9325
-static void tft_init(struct fb_info *info)	
+static void tft_init(struct fb_info *info)    
 {
-	uint16_t c, d;
-	uint16_t i = 0;
-        //printk(KERN_INFO "fb%d: tft_init\n", info->node);
+    uint16_t c, d;
+    uint16_t i = 0;
+    //printk(KERN_INFO "fb%d: tft_init\n", info->node);
 
-	// Copied from an Arduino example
-	while(i < sizeof(ILI932x_regValues) / sizeof(uint16_t)) {
-		c = ILI932x_regValues[i++];
-		d = ILI932x_regValues[i++];
-		if(c == TFTLCD_DELAY) {
-			mdelay(d);
-		} else {
-			tft_command_write16(c);
-			tft_data_write16(d);
-			gpio_setstate(CS,1);
-			//printk("%x.....%x..%x\n",c,d >> 8,d & 0xff);
-		}
-	}
-	tft_command_write16(ILI932X_ENTRY_MOD); // Rotation
-	tft_data_write16(rotation);
-	gpio_setstate(CS,1);
+    // Copied from an Arduino example
+    while(i < sizeof(ILI932x_regValues) / sizeof(uint16_t)) {
+        c = ILI932x_regValues[i++];
+        d = ILI932x_regValues[i++];
+        if(c == TFTLCD_DELAY) {
+            mdelay(d);
+        } else {
+            tft_command_write16(c);
+            tft_data_write16(d);
+            gpio_setstate(CS,1);
+            //printk("%x.....%x..%x\n",c,d >> 8,d & 0xff);
+        }
+    }
+    tft_command_write16(ILI932X_ENTRY_MOD); // Rotation
+    tft_data_write16(rotation);
+    gpio_setstate(CS,1);
 }
 /*
 // write memory to TFT
-static void ili9325_update_display_area(const struct fb_image *image)	
+static void ili9325_update_display_area(const struct fb_image *image)    
 {
-	int x,y;
-	printk(KERN_INFO "ili9325_update_display_area %d %d\n", image->dx, image->dy);
+    int x,y;
+    printk(KERN_INFO "ili9325_update_display_area %d %d\n", image->dx, image->dy);
 
-	// set column
-	(ORIENTATION) ? tft_command_write16(ILI932X_GRAM_HOR_AD) : tft_command_write16(ILI932X_GRAM_VER_AD); // ILI9341_PAGEADDRSET ILI9341_COLADDRSET
-	//tft_data_write16(image->dx >> 8);
-	tft_data_write16(image->dx);
-	//tft_data_write16((image->dx + image->width) >> 8);
-	tft_data_write16(image->dx + image->width);
-	gpio_setstate(CS,1);
+    // set column
+    (ORIENTATION) ? tft_command_write16(ILI932X_GRAM_HOR_AD) : tft_command_write16(ILI932X_GRAM_VER_AD); // ILI9341_PAGEADDRSET ILI9341_COLADDRSET
+    //tft_data_write16(image->dx >> 8);
+    tft_data_write16(image->dx);
+    //tft_data_write16((image->dx + image->width) >> 8);
+    tft_data_write16(image->dx + image->width);
+    gpio_setstate(CS,1);
 
-	// set row
-	(ORIENTATION) ? tft_command_write16(ILI932X_GRAM_VER_AD) : tft_command_write16(ILI932X_GRAM_HOR_AD);
-	//tft_data_write16(image->dy >> 8);
-	tft_data_write16(image->dy);
-	//tft_data_write16((image->dy + image->height) >> 8);
-	tft_data_write16(image->dy + image->height);
-	gpio_setstate(CS,1);
+    // set row
+    (ORIENTATION) ? tft_command_write16(ILI932X_GRAM_VER_AD) : tft_command_write16(ILI932X_GRAM_HOR_AD);
+    //tft_data_write16(image->dy >> 8);
+    tft_data_write16(image->dy);
+    //tft_data_write16((image->dy + image->height) >> 8);
+    tft_data_write16(image->dy + image->height);
+    gpio_setstate(CS,1);
 
-	tft_command_write16(ILI932X_RW_GRAM); //Memory Write
+    tft_command_write16(ILI932X_RW_GRAM); //Memory Write
 
-	if (ORIENTATION == 0) {
-		for(y=0;y < image->width ;y++){
-			for(x=0;x < image->height ;x++){
-				tft_data_write16(image->data[(image->dx * (2 * image->width)) + (image->dy * 2) + 1]);
-				tft_data_write16(image->data[(image->dx * (2 * image->width)) + (image->dy * 2) + 2]);
-			}
-		}
-	} else {
-		for(y=0;y < image->width ;y++){
-			for(x=0;x < image->height ;x++){
-				tft_data_write16(image->data[(image->dx * (2 * image->width)) + (image->dy * 2) + 1]);
-				tft_data_write16(image->data[(image->dx * (2 * image->width)) + (image->dy * 2) + 2]);
-			}
-		}
-	}
+    if (ORIENTATION == 0) {
+        for(y=0;y < image->width ;y++){
+            for(x=0;x < image->height ;x++){
+                tft_data_write16(image->data[(image->dx * (2 * image->width)) + (image->dy * 2) + 1]);
+                //tft_data_write16(image->data[(image->dx * (2 * image->width)) + (image->dy * 2) + 2]);
+            }
+        }
+    } else {
+        for(y=0;y < image->width ;y++){
+            for(x=0;x < image->height ;x++){
+                tft_data_write16(image->data[(image->dx * (2 * image->width)) + (image->dy * 2) + 1]);
+                //tft_data_write16(image->data[(image->dx * (2 * image->width)) + (image->dy * 2) + 2]);
+            }
+        }
+    }
 
-	gpio_setstate(CS,1);
+    gpio_setstate(CS,1);
 }
 */
 /*
-static void ili9325_update_display_color_area(const struct fb_fillrect *rect)	
+static void ili9325_update_display_color_area(const struct fb_fillrect *rect)    
 {
-	int x,y;
-	printk(KERN_INFO "ili9325_update_display_color_area %d %d\n", rect->dx, rect->dy);
+    int x,y;
+    printk(KERN_INFO "ili9325_update_display_color_area %d %d\n", rect->dx, rect->dy);
 
-	// set column
-	(ORIENTATION) ? tft_command_write16(ILI932X_GRAM_HOR_AD) : tft_command_write16(ILI932X_GRAM_VER_AD); // ILI9341_PAGEADDRSET ILI9341_COLADDRSET
-	//tft_data_write16(rect->dx >> 8);
-	tft_data_write16(rect->dx);
-	//tft_data_write16((rect->dx + rect->width) >> 8);
-	tft_data_write16(rect->dx + rect->width);
-	gpio_setstate(CS,1);
+    // set column
+    (ORIENTATION) ? tft_command_write16(ILI932X_GRAM_HOR_AD) : tft_command_write16(ILI932X_GRAM_VER_AD); // ILI9341_PAGEADDRSET ILI9341_COLADDRSET
+    //tft_data_write16(rect->dx >> 8);
+    tft_data_write16(rect->dx);
+    //tft_data_write16((rect->dx + rect->width) >> 8);
+    tft_data_write16(rect->dx + rect->width);
+    gpio_setstate(CS,1);
 
-	// set row
-	(ORIENTATION) ? tft_command_write16(ILI932X_GRAM_VER_AD) : tft_command_write16(ILI932X_GRAM_HOR_AD);
-	//tft_data_write16(rect->dy >> 8);
-	tft_data_write16(rect->dy);
-	//tft_data_write16((rect->dy + rect->height) >> 8);
-	tft_data_write16(rect->dy + rect->height);
-	gpio_setstate(CS,1);
+    // set row
+    (ORIENTATION) ? tft_command_write16(ILI932X_GRAM_VER_AD) : tft_command_write16(ILI932X_GRAM_HOR_AD);
+    //tft_data_write16(rect->dy >> 8);
+    tft_data_write16(rect->dy);
+    //tft_data_write16((rect->dy + rect->height) >> 8);
+    tft_data_write16(rect->dy + rect->height);
+    gpio_setstate(CS,1);
 
-	tft_command_write16(ILI932X_RW_GRAM); //Memory Write
+    tft_command_write16(ILI932X_RW_GRAM); //Memory Write
 
-	if (ORIENTATION == 0) {
-		for(y=0;y < rect->width ;y++){
-			for(x=0;x < rect->height ;x++){
-				tft_data_write16(rect->color);
-				//tft_data_write16(rect->color >> 8);
-			}
-		}
-	} else {
-		for(y=0;y < rect->height ;y++){
-			for(x=0;x < rect->width ;x++){
-				tft_data_write16(rect->color);
-				//tft_data_write16(rect->color >> 8);
-			}
-		}
-	}
+    if (ORIENTATION == 0) {
+        for(y=0;y < rect->width ;y++){
+            for(x=0;x < rect->height ;x++){
+                tft_data_write16(rect->color);
+                //tft_data_write16(rect->color >> 8);
+            }
+        }
+    } else {
+        for(y=0;y < rect->height ;y++){
+            for(x=0;x < rect->width ;x++){
+                tft_data_write16(rect->color);
+                //tft_data_write16(rect->color >> 8);
+            }
+        }
+    }
 
-	gpio_setstate(CS,1);
+    gpio_setstate(CS,1);
 }
 */
-static void ili9325_update_display(const struct fb_info *info)	
+static void ili9325_update_display(const struct fb_info *info)    
 {
-	int x,y;
-	//printk(KERN_INFO "fb%d: ili9325_update_display\n", info->node);
+    int x, y, x2, y2;
+    int r1, g1, b1;
+    uint16_t pixel;
 
+/*  Commented out, but might be needed for other ili9325 ?
         tft_command_write16(ILI932X_GRAM_HOR_AD);
         tft_data_write16(0);
-	gpio_setstate(CS,1);
+        gpio_setstate(CS,1);
         tft_command_write16(ILI932X_GRAM_VER_AD);
         tft_data_write16(0);
-	gpio_setstate(CS,1);
+        gpio_setstate(CS,1);
+*/
+    // Box filtering ? - only really works best with scale=2
+    if (scaletype == 2) {
+            for (y=0; y < DISPLAY_HEIGHT; y+=scale) {
+                    for (x=0; x < DISPLAY_WIDTH; x+=scale) {
+                        r1=0;
+                        g1=0;
+                        b1=0;
+                        for (y2 = y; y2 < (y + scale); y2++) {
+                            for (x2 = x; x2 < (x + scale); x2++) {
+                                pixel = *((uint16_t*) &(info->screen_base[((DISPLAY_WIDTH * y2) + x2) * 2]) );
+                                r1 += (pixel & 0xF800) >> 11;
+                                g1 += (pixel & 0x07E0) >> 5;
+                                b1 +=  pixel & 0x001F;
+                            }
+                        }
+                        r1 /= scale * 2;
+                        g1 /= scale * 2;
+                        b1 /= scale * 2;
+                        pixel = (r1 << 11) | (g1 << 5) | b1;
+                        info->screen_base[(((DISPLAY_WIDTH * y) + x) * 2) + 1] = pixel >> 8; // Back into the buffer
+                        info->screen_base[(((DISPLAY_WIDTH * y) + x) * 2)    ] = pixel & 0xFF;
+                    }
+            }
+    }
 
-	tft_command_write16(ILI932X_RW_GRAM); // Mem Write
 
-	if (ORIENTATION == 0) { // This one
-		for (y=0;y < DISPLAY_WIDTH ;y++) {
-			//printk("%d ", info->screen_base[(x * (2 * DISPLAY_WIDTH)) + (y * 2) + 1]);
-			//printk(KERN_INFO "fb%d: ili9325_update_display %d\n", info->node, t);
-			for (x=0;x < DISPLAY_HEIGHT ;x++) {
-				tft_data_write16( ( (info->screen_base[(x * (2 * DISPLAY_WIDTH)) + (y * 2) + 1]) << 8 ) |
-						    (info->screen_base[(x * (2 * DISPLAY_WIDTH)) + (y * 2) + 2]) );
-//				// Use below line as alternative if the cpu is big-endian
-//				tft_data_write16( *((uint16_t*) &(info->screen_base[(x * (2 * DISPLAY_WIDTH)) + (y * 2) + 1]) ) );
-			}
-		}
-	} else {
-		for (y=(DISPLAY_HEIGHT - 1);y >= 0 ;y--) {
-			for (x=0;x < DISPLAY_WIDTH ;x++) {
-				tft_data_write16( ( (info->screen_base[(y * (2 * DISPLAY_WIDTH)) + (x * 2) + 1]) << 8 ) |
-						    (info->screen_base[(y * (2 * DISPLAY_WIDTH)) + (x * 2) + 2]) );
-			}
-		}
-	}
-	gpio_setstate(CS,1);
-	//printk(KERN_INFO "fb%d: ili9325_update_display full\n", info->node);
+    tft_command_write16(ILI932X_RW_GRAM); // Mem Write
+
+    for (y=0; y < DISPLAY_HEIGHT; y+=scale) {
+        for (x=0; x < DISPLAY_WIDTH; x+=scale) {
+            tft_data_write16( *((uint16_t*) &(info->screen_base[((DISPLAY_WIDTH * y) + x) * 2]) ) );
+        }
+    }
+    gpio_setstate(CS,1);
+    //printk(KERN_INFO "fb%d: ili9325_update_display full\n", info->node);
 }
 
-static void ili9325_fillrect(struct fb_info *info, const struct fb_fillrect *rect)	
+static void ili9325_fillrect(struct fb_info *info, const struct fb_fillrect *rect)    
 {
-	//printk(KERN_INFO "fb%d: ili9325_fillrect\n", info->node);
-	//ili9325_update_display_color_area(rect);
-	ili9325_update_display(info);
+    //printk(KERN_INFO "fb%d: ili9325_fillrect\n", info->node);
+    //ili9325_update_display_color_area(rect);
+    ili9325_update_display(info);
 }
 
-static void ili9325_copyarea(struct fb_info *info, const struct fb_copyarea *area)	
+static void ili9325_copyarea(struct fb_info *info, const struct fb_copyarea *area)    
 {
-	//printk(KERN_INFO "fb%d: ili9325_copyarea\n", info->node);
-	ili9325_update_display(info);
+    //printk(KERN_INFO "fb%d: ili9325_copyarea\n", info->node);
+    ili9325_update_display(info);
 }
 
-static void ili9325_imageblit(struct fb_info *info, const struct fb_image *image)	
+static void ili9325_imageblit(struct fb_info *info, const struct fb_image *image)    
 {
-	//printk(KERN_INFO "fb%d: ili9325_imageblit\n", info->node);
-	//ili9325_update_display_area(image);
-	ili9325_update_display(info);
+    //printk(KERN_INFO "fb%d: ili9325_imageblit\n", info->node);
+    //ili9325_update_display_area(image);
+    ili9325_update_display(info);
 }
 
-static ssize_t ili9325_write(struct fb_info *info, const char __user *buf, size_t count, loff_t *ppos)	
+static ssize_t ili9325_write(struct fb_info *info, const char __user *buf, size_t count, loff_t *ppos)    
 {
-	unsigned long p = *ppos;
-	void *dst;
-	int err = 0;
-	unsigned long total_size;
-	//printk(KERN_INFO "ili9325_write %d\n", count);
+    unsigned long p = *ppos;
+    void *dst;
+    int err = 0;
+    unsigned long total_size;
+    //printk(KERN_INFO "ili9325_write cnt=%d\n", count);
 
-	if (info->state != FBINFO_STATE_RUNNING)
-		return -EPERM;
+    if (info->state != FBINFO_STATE_RUNNING)
+        return -EPERM;
 
-	total_size = info->screen_size;
+    total_size = info->screen_size;
 
-	if (total_size == 0)
-		total_size = info->fix.smem_len;
+    if (total_size == 0)
+        total_size = info->fix.smem_len;
 
-	if (p > total_size)
-		return -EFBIG;
+    if (p > total_size)
+        return -EFBIG;
 
-	if (count > total_size) {
-		err = -EFBIG;
-		count = total_size;
-	}
+    if (count > total_size) {
+        err = -EFBIG;
+        count = total_size;
+    }
 
-	if (count + p > total_size) {
-		if (!err)
-			err = -ENOSPC;
+    if (count + p > total_size) {
+        if (!err)
+            err = -ENOSPC;
 
-		count = total_size - p;
-	}
+        count = total_size - p;
+    }
 
-	dst = (void __force *) (info->screen_base + p);
+    dst = (void __force *) (info->screen_base + p);
 
-	if (info->fbops->fb_sync)
-		info->fbops->fb_sync(info);
+    if (info->fbops->fb_sync)
+        info->fbops->fb_sync(info);
 
-	if (copy_from_user(dst, buf, count))
-		err = -EFAULT;
+    if (copy_from_user(dst, buf, count))
+        err = -EFAULT;
 
-	if  (!err)
-		*ppos += count;
+    if  (!err)
+        *ppos += count;
 
-	ili9325_update_display(info);
+    ili9325_update_display(info);
 
-	return (err) ? err : count;
+    return (err) ? err : count;
 }
 
-static ssize_t ili9325_read(struct fb_info *info, char __user *buf, size_t count, loff_t *ppos)	
+static ssize_t ili9325_read(struct fb_info *info, char __user *buf, size_t count, loff_t *ppos)    
 {
-	unsigned long p = *ppos;
-	void *dst;
-	int err = 0;
-	unsigned long total_size;
-	//printk(KERN_INFO "ili9325_read %d\n", count);
+    unsigned long p = *ppos;
+    void *dst;
+    int err = 0;
+    unsigned long total_size;
+    //printk(KERN_INFO "ili9325_read cnt=%d\n", count);
 
-	if (info->state != FBINFO_STATE_RUNNING)
-		return -EPERM;
+    if (info->state != FBINFO_STATE_RUNNING)
+        return -EPERM;
 
-	total_size = info->screen_size;
+    total_size = info->screen_size;
 
-	if (total_size == 0)
-		total_size = info->fix.smem_len;
+    if (total_size == 0)
+        total_size = info->fix.smem_len;
 
-	if (p > total_size)
-		return -EFBIG;
+    if (p > total_size)
+        return -EFBIG;
 
-	if (count > total_size) {
-		err = -EFBIG;
-		count = total_size;
-	}
+    if (count > total_size) {
+        err = -EFBIG;
+        count = total_size;
+    }
 
-	if (count + p > total_size) {
-		if (!err)
-			err = -ENOSPC;
+    if (count + p > total_size) {
+        if (!err)
+            err = -ENOSPC;
 
-		count = total_size - p;
-	}
+        count = total_size - p;
+    }
 
-	dst = (void __force *) (info->screen_base + p);
+    dst = (void __force *) (info->screen_base + p);
 
-	if (info->fbops->fb_sync)
-		info->fbops->fb_sync(info);
+    if (info->fbops->fb_sync)
+        info->fbops->fb_sync(info);
 
-	if (copy_from_user(dst, buf, count))
-		err = -EFAULT;
+    if (copy_from_user(dst, buf, count))
+        err = -EFAULT;
 
-	if  (!err)
-		*ppos += count;
+    if  (!err)
+        *ppos += count;
 
-	return (err) ? err : count;
+    return (err) ? err : count;
 }
 
 
-static void ili9325_deferred_io(struct fb_info *info, struct list_head *pagelist)	
+static void ili9325_deferred_io(struct fb_info *info, struct list_head *pagelist)    
 {
-	ili9325_update_display(info);
+    ili9325_update_display(info);
 }
 
 
@@ -639,18 +652,18 @@ static struct fb_fix_screeninfo ili9325_fix = {
     .xpanstep       = 0,
     .ypanstep       = 0,
     .ywrapstep      = 0,
-    .line_length    = DISPLAY_WIDTH * DISPLAY_BPP / 8,
+    .line_length    = PHY_DISPLAY_WIDTH * DISPLAY_BPP / 8, // May change in probe()
 };
 
 
 static struct fb_var_screeninfo ili9325_var = {
-    .width          = DISPLAY_WIDTH,
-    .height         = DISPLAY_HEIGHT,
+    .width          = PHY_DISPLAY_WIDTH,
+    .height         = PHY_DISPLAY_HEIGHT,
     .bits_per_pixel = DISPLAY_BPP,
-    .xres           = DISPLAY_WIDTH,
-    .yres           = DISPLAY_HEIGHT,
-    .xres_virtual   = DISPLAY_WIDTH,
-    .yres_virtual   = DISPLAY_HEIGHT,
+    .xres           = PHY_DISPLAY_WIDTH,
+    .yres           = PHY_DISPLAY_HEIGHT,
+    .xres_virtual   = PHY_DISPLAY_WIDTH,
+    .yres_virtual   = PHY_DISPLAY_HEIGHT,
     .activate       = FB_ACTIVATE_NOW,
     .vmode          = FB_VMODE_NONINTERLACED,
 
@@ -681,7 +694,7 @@ static struct fb_deferred_io ili9325_defio = {
 };
 
 
-static int ili9325_probe(struct platform_device *pdev)	
+static int ili9325_probe(struct platform_device *pdev)    
 {
     struct fb_info *info;
     int retval = -ENOMEM;
@@ -690,7 +703,35 @@ static int ili9325_probe(struct platform_device *pdev)
     int x, y, rnd=0;
 
 
-    vmem_size = ili9325_var.width * ili9325_var.height * ili9325_var.bits_per_pixel/8;
+    // Rotation
+    rotation |= 0x1000;
+    if ((rotation & 0x8) == 0) { // Check it is Portrait mode, Landscape is the default
+        DISPLAY_HEIGHT = PHY_DISPLAY_WIDTH;
+        DISPLAY_WIDTH  = PHY_DISPLAY_HEIGHT;
+        ili9325_fix.line_length    = DISPLAY_WIDTH * DISPLAY_BPP / 8;
+        ili9325_var.width          = DISPLAY_WIDTH;
+        ili9325_var.height         = DISPLAY_HEIGHT;
+        ili9325_var.xres           = DISPLAY_WIDTH;
+        ili9325_var.yres           = DISPLAY_HEIGHT;
+        ili9325_var.xres_virtual   = DISPLAY_WIDTH;
+        ili9325_var.yres_virtual   = DISPLAY_HEIGHT;
+    }
+    // Change Scaling
+    if (scale > 1) {
+        DISPLAY_WIDTH  = DISPLAY_WIDTH  * scale;
+        DISPLAY_HEIGHT = DISPLAY_HEIGHT * scale;
+        ili9325_fix.line_length    = DISPLAY_WIDTH * DISPLAY_BPP / 8;
+        ili9325_var.width          = DISPLAY_WIDTH;
+        ili9325_var.height         = DISPLAY_HEIGHT;
+        ili9325_var.xres           = DISPLAY_WIDTH;
+        ili9325_var.yres           = DISPLAY_HEIGHT;
+        ili9325_var.xres_virtual   = DISPLAY_WIDTH;
+        ili9325_var.yres_virtual   = DISPLAY_HEIGHT;
+    } else if (scale < 1) {
+        scale = 1;
+    }
+
+    vmem_size = ili9325_var.width * ili9325_var.height * ili9325_var.bits_per_pixel / 8;
     vmem = vzalloc(vmem_size);
     if (!vmem) {
         return -ENOMEM;
@@ -733,43 +774,43 @@ static int ili9325_probe(struct platform_device *pdev)
 
     tft_init_board(info);
 /*
-	// Dump the registers before init()
-	for(i=0; i<=0x97; i++) {
-		tft_command_write16(i); // Reg Num
-		gpio_setstate(DC,1);
-                printk(KERN_INFO "0x%02X = 0x%04X", i, gpio_read());
-		gpio_setstate(CS,1);
-	}
+    // Dump the registers before init()
+    for(i=0; i<=0x97; i++) {
+        tft_command_write16(i); // Reg Num
+        gpio_setstate(DC,1);
+        printk(KERN_INFO "0x%02X = 0x%04X", i, gpio_read());
+        gpio_setstate(CS,1);
+    }
 */
     tft_hard_reset();
     tft_init(info);
 
-        // Randomise Splash screen indicates its loaded
-        tft_command_write16(ILI932X_GRAM_HOR_AD);
-        tft_data_write16(0);
-        gpio_setstate(CS,1);
-        tft_command_write16(ILI932X_GRAM_VER_AD);
-        tft_data_write16(0);
-        gpio_setstate(CS,1);
+    // Randomise Splash screen indicates its loaded
+    tft_command_write16(ILI932X_GRAM_HOR_AD);
+    tft_data_write16(0);
+    gpio_setstate(CS,1);
+    tft_command_write16(ILI932X_GRAM_VER_AD);
+    tft_data_write16(0);
+    gpio_setstate(CS,1);
 
-        tft_command_write16(ILI932X_RW_GRAM); // Mem Write
+    tft_command_write16(ILI932X_RW_GRAM); // Mem Write
 
-        for (y=0;y < DISPLAY_WIDTH ;y++) {
-                get_random_bytes(&rnd, 2);
-                for (x=0;x < DISPLAY_HEIGHT ;x++) {
-                        tft_data_write16(rnd);
-                }
+    for (y=0;y < DISPLAY_HEIGHT ;y++) {
+        get_random_bytes(&rnd, 2);
+        for (x=0;x < DISPLAY_WIDTH ;x++) {
+            tft_data_write16(rnd);
         }
-        gpio_setstate(CS,0);
+    }
+    gpio_setstate(CS,1);
 
 
-    printk(KERN_INFO "fb%d: probe ili9325 LCD framebuffer device\n", info->node);
+    printk(KERN_INFO "fb%d: probe ili9325 LCD framebuffer device rot=0x%x,scale=%d\n", info->node, rotation, scale);
     return 0;
 }
 
 
 
-static int ili9325_remove(struct platform_device *dev)	
+static int ili9325_remove(struct platform_device *dev)    
 {
     struct fb_info *info = platform_get_drvdata(dev);
 
@@ -797,7 +838,7 @@ static struct platform_driver ili9325_driver = {
 
 static struct platform_device *ili9325_device;
 
-static int __init ili9325_init(void)	
+static int __init ili9325_init(void)    
 {
     int ret = platform_driver_register(&ili9325_driver);
     if (0 == ret) {
@@ -812,20 +853,23 @@ static int __init ili9325_init(void)
             platform_driver_unregister(&ili9325_driver);
         }
     }
-    //printk("ili9325, ret:%d", ret);
     return ret;
 }
 
-static void __exit ili9325_exit(void)	
+static void __exit ili9325_exit(void)    
 {
     platform_device_unregister(ili9325_device);
     platform_driver_unregister(&ili9325_driver);
 }
 
-module_param(fps, uint, 0444);
-MODULE_PARM_DESC(fps, "Frames per second (default 25)");
-module_param(rotation, uint, 0444);
-MODULE_PARM_DESC(rotation, "Rotation: Land1=0x1000 Land2=0x1030");
+module_param(fps, uint, 0440); // Read Only
+MODULE_PARM_DESC(fps, "Frames per second");
+module_param(rotation, uint, 0440);
+MODULE_PARM_DESC(rotation, "Rotation: 0x08=Land1 0x38=Land2 0x20=Port1 0x10=Port2");
+module_param(scale, uint, 0440);
+MODULE_PARM_DESC(scale, "Scale down: 1 2 3 4");
+module_param(scaletype, uint, 0440);
+MODULE_PARM_DESC(scaletype, "Scale type: 1=Quick, 2=Averaging");
 
 module_init(ili9325_init);
 module_exit(ili9325_exit);
